@@ -99,16 +99,17 @@ namespace smarx.WazStorageExtensions
                 cancellationToken.ThrowIfCancellationRequested();
 
                 while (! cancellationToken.IsCancellationRequested)
-                {
+                {	// NOTE: Use Trace.WriteLine for Azure logging (which is considered Verbose)
+					// 		 as this loop will generate a large volume of messages.
                     cancellationToken.ThrowIfCancellationRequested();
-                    Trace.TraceInformation("RenewalTask started waiting @ " + DateTime.Now.ToLocalTime());
+                    Trace.WriteLine("RenewalTask started waiting @ " + DateTime.Now.ToLocalTime());
                     Thread.Sleep(TimeSpan.FromSeconds(30));
-                    Trace.TraceInformation("RenewalTask is done waiting @ " + DateTime.Now.ToLocalTime());
+                    Trace.WriteLine("RenewalTask is done waiting @ " + DateTime.Now.ToLocalTime());
 
                     retryPolicy.ExecuteAction(() => lockBlob.RenewLease(leaseId));
 
                     var message = String.Format("Lease renewed for leaseId: '{0}'", leaseId);
-                    Trace.TraceInformation(message);
+                    Trace.WriteLine(message);
 
                 }
             }, cancellationToken);
