@@ -1,13 +1,14 @@
-﻿using Microsoft.WindowsAzure.StorageClient;
+﻿using Microsoft.Practices.EnterpriseLibrary.WindowsAzure.TransientFaultHandling.AzureStorage;
+using Microsoft.WindowsAzure.StorageClient;
 using System;
 using System.Threading;
 using System.Net;
 using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Text;
-using Microsoft.AzureCAT.Samples.TransientFaultHandling;
-using Microsoft.AzureCAT.Samples.TransientFaultHandling.AzureStorage;
-using TransientFaultHandlingAlias = Microsoft.AzureCAT.Samples.TransientFaultHandling;
+using Microsoft.Practices.TransientFaultHandling;
+// Avoid an ambiguous reference with Microsoft.WindowsAzure.StorageClient.RetryPolicy
+using RetryPolicy = Microsoft.Practices.TransientFaultHandling.RetryPolicy;
 
 namespace smarx.WazStorageExtensions
 {
@@ -21,22 +22,21 @@ namespace smarx.WazStorageExtensions
         public static void DoOnce(CloudBlob blob, Action action, TimeSpan pollingFrequency)
         {
             while (!blob.Exists() || blob.Metadata["progress"] != "done")
-            {
-                using (var arl = new AutoRenewLease(blob))
+            {   // NOTE.ZJG: Removed the using block to avoid access to disposed object from within the closure.
+                var arl = new AutoRenewLease(blob);
+                if (arl.HasLease)
                 {
-                    if (arl.HasLease)
-                    {
-                        var policy = new TransientFaultHandlingAlias.RetryPolicy<StorageTransientErrorDetectionStrategy>(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3));
-                        policy.ExecuteAction(() => {
-                            action();
-                            blob.Metadata["progress"] = "done";
-                            blob.SetMetadata(arl.leaseId);
-                        });
-                    }
-                    else
-                    {
-                        Thread.Sleep(pollingFrequency);
-                    }
+                    var policy = new RetryPolicy<StorageTransientErrorDetectionStrategy>(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3));
+                    policy.ExecuteAction(() => {
+                        action();
+                        blob.Metadata["progress"] = "done";
+                        blob.SetMetadata(arl.leaseId);
+                        arl.Dispose();
+                    });
+                }
+                else
+                {
+                    Thread.Sleep(pollingFrequency);
                 }
             }
         }
@@ -76,11 +76,11 @@ namespace smarx.WazStorageExtensions
 
             if (HasLease)
             {
-                Trace.WriteLine("Acquired lease, leaseId: " + leaseId);
+                Trace.TraceInformation("Acquired lease, leaseId: " + leaseId);
                 StartRenewalTask(blob);
             }
             else {
-                Trace.WriteLine("Lease not acquired.");
+                Trace.TraceInformation("Lease not acquired.");
             }
         }
 
@@ -90,7 +90,7 @@ namespace smarx.WazStorageExtensions
             GC.SuppressFinalize(this);
         }
 
-        private void StartRenewalTask(CloudBlob blob)
+        private void StartRenewalTask(CloudBlob lockBlob)
         {
             cancellationSource = new CancellationTokenSource();
             var cancellationToken = cancellationSource.Token;
@@ -99,15 +99,14 @@ namespace smarx.WazStorageExtensions
                 cancellationToken.ThrowIfCancellationRequested();
 
                 while (! cancellationToken.IsCancellationRequested)
-                {
+                {	// NOTE: Use Trace.WriteLine for Azure logging (which is considered Verbose)
+					// 		 as this loop will generate a large volume of messages.
                     cancellationToken.ThrowIfCancellationRequested();
                     Trace.WriteLine("RenewalTask started waiting @ " + DateTime.Now.ToLocalTime());
                     Thread.Sleep(TimeSpan.FromSeconds(30));
                     Trace.WriteLine("RenewalTask is done waiting @ " + DateTime.Now.ToLocalTime());
 
-                    retryPolicy.ExecuteAction(() => {
-                        blob.RenewLease(leaseId);
-                    });
+                    retryPolicy.ExecuteAction(() => lockBlob.RenewLease(leaseId));
 
                     var message = String.Format("Lease renewed for leaseId: '{0}'", leaseId);
                     Trace.WriteLine(message);
@@ -115,8 +114,13 @@ namespace smarx.WazStorageExtensions
                 }
             }, cancellationToken);
 
-            renewalTask.ContinueWith(task => {
-                task.Exception.Handle(inner => {
+            renewalTask.ContinueWith(task =>
+                {
+                    Debug.Assert(
+                            task.Exception != null,
+                           "task.Exception == null");
+
+                    task.Exception.Handle(inner => {
                     if (inner is OperationCanceledException)
                     {
                         Trace.TraceInformation("RenewalTask was canceled");
@@ -124,13 +128,13 @@ namespace smarx.WazStorageExtensions
                     else
                     {
                         leaseId = null;
-                        var message = String.Format("RenewalTask encountered an error while attempting to renew lease on blob '{0}' for leaseId '{1}', Exception: {2}", blob.Uri.ToString(), leaseId, UnwindException(inner));
+                        var message = String.Format("RenewalTask encountered an error while attempting to renew lease on blob '{0}' for leaseId '{1}', Exception: {2}", lockBlob.Uri.ToString(), leaseId, UnwindException(inner));
                         Trace.TraceError(message);
                     }
 
                     return true;
                 });
-            }, TaskContinuationOptions.OnlyOnFaulted);
+                }, TaskContinuationOptions.OnlyOnFaulted);
         }
 
         private string UnwindException(Exception ex)
@@ -164,7 +168,7 @@ namespace smarx.WazStorageExtensions
                         catch (Exception ex)
                         {
                             var message = String.Format("ReleaseLease failed: {0}", UnwindException(ex));
-                            Trace.WriteLine(message);
+                            Trace.TraceError(message);
                         }
 
                         try
@@ -176,7 +180,7 @@ namespace smarx.WazStorageExtensions
                         catch (Exception ex)
                         {
                             var message = String.Format("CancellationSource.Cancel failed: {0}", UnwindException(ex));
-                            Trace.WriteLine(message);
+                            Trace.TraceError(message);
                         }
                     }
                 }
@@ -191,7 +195,7 @@ namespace smarx.WazStorageExtensions
             Dispose(false);
         }
 
-        private TransientFaultHandlingAlias.RetryPolicy retryPolicy = new RetryPolicy<StorageTransientErrorDetectionStrategy>(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3));
+        private RetryPolicy retryPolicy = new RetryPolicy<StorageTransientErrorDetectionStrategy>(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3));
         private CloudBlob blob;
         private CancellationTokenSource cancellationSource;
         private string leaseId;
